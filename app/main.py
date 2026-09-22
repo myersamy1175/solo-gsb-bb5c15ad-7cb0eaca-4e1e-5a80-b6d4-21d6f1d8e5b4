@@ -22,6 +22,7 @@ from .framing import (
     StreamFramer,
 )
 from .parser import ParseError, parse_message
+from .profiler import VersionProfile
 from .schemas import (
     CompatibilityRequest,
     DefinitionCreate,
@@ -29,6 +30,7 @@ from .schemas import (
     EncodeRequest,
     FixtureCreate,
     FixtureRunRequest,
+    MessageProfileRequest,
     ParseRequest,
     StreamParseRequest,
     validate_definition,
@@ -167,19 +169,73 @@ def compatibility(device_type: str, req: CompatibilityRequest):
 _HEX_CLEANER = re.compile(r"(0[xX])|[\s_-]")
 
 
-def _decode_hex(hex_payload: str) -> bytes:
-    """Shared by /parse and /detect: strip whitespace/separators/0x prefix and
-    decode. Raises HTTP 422 on an empty or non-hex payload."""
+def _clean_hex(hex_payload: str):
+    """Strip whitespace/separators/0x prefix and decode. Returns
+    ``(data, None)`` or ``(None, reason)`` on an empty or non-hex payload."""
     cleaned = _HEX_CLEANER.sub("", hex_payload)
     if not cleaned:
-        raise HTTPException(status_code=422, detail="hex payload is empty")
+        return None, "hex payload is empty"
     try:
-        return bytes.fromhex(cleaned)
+        return bytes.fromhex(cleaned), None
     except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail="invalid hex payload: non-hex characters or odd number of digits",
+        return None, (
+            "invalid hex payload: non-hex characters or odd number of digits"
         )
+
+
+def _decode_hex(hex_payload: str) -> bytes:
+    """Shared by /parse and /detect. Raises HTTP 422 on a bad payload."""
+    data, reason = _clean_hex(hex_payload)
+    if reason is not None:
+        raise HTTPException(status_code=422, detail=reason)
+    return data
+
+
+def _detect_versions(records, data: bytes, unit: str = "message"):
+    """Shared by /detect and /messages/profile: try every registered version
+    of a device type (including inactive ones, in version order) against one
+    complete byte payload, using the same acceptance rule as
+    :func:`_match_definition` (full consumption + checksum verification).
+
+    Returns ``(matched_records, matched_result, failures)`` where
+    ``matched_records`` is the ordered list of accepting records,
+    ``matched_result`` is the parse result of the last (only meaningful when
+    exactly one matches), and ``failures`` lists per-version failure reasons.
+    """
+    matched_records = []
+    matched_result = None
+    failures = []
+    for record in records:
+        result, rejection = _match_definition(record, data, unit=unit)
+        if rejection is None:
+            matched_records.append(record)
+            matched_result = result
+        else:
+            failures.append(
+                {
+                    "version": record["version"],
+                    "active": record["active"],
+                    "reason": rejection[1],
+                }
+            )
+    return matched_records, matched_result, failures
+
+
+def _no_detection_reason(failures, unit: str = "message") -> str:
+    """Umbrella detail text when detection finds zero matching versions."""
+    reasons = "; ".join(f"{f['version']}: {f['reason']}" for f in failures)
+    return (
+        f"no registered version matches the {unit} ({len(failures)} "
+        f"version(s) tried): {reasons}"
+    )
+
+
+def _ambiguous_detection_reason(versions) -> str:
+    """Detail text when detection matches several versions."""
+    return (
+        f"message matches {len(versions)} registered versions "
+        f"({', '.join(versions)}); cannot pick a version without an explicit hint"
+    )
 
 
 def _select_definition(device_type: str, version: Optional[str]) -> dict:
@@ -295,31 +351,12 @@ def detect(req: DetectRequest):
 
     data = _decode_hex(req.hex)
 
-    candidates = []
-    failures = []
-    for record in records:
-        result, rejection = _match_definition(record, data, unit="message")
-        if rejection is None:
-            candidates.append(
-                {
-                    "version": record["version"],
-                    "active": record["active"],
-                    "result": _parse_result_for_record(record, result),
-                }
-            )
-        else:
-            failures.append(
-                {
-                    "version": record["version"],
-                    "active": record["active"],
-                    "reason": rejection[1],
-                }
-            )
+    matched_records, matched_result, failures = _detect_versions(records, data)
 
-    if len(candidates) == 1:
-        return candidates[0]["result"]
+    if len(matched_records) == 1:
+        return _parse_result_for_record(matched_records[0], matched_result)
 
-    if not candidates:
+    if not matched_records:
         raise HTTPException(
             status_code=422,
             detail={
@@ -336,10 +373,119 @@ def detect(req: DetectRequest):
             "an explicit version is required",
             "device_type": req.device_type,
             "candidates": [
-                {"version": c["version"], "active": c["active"]} for c in candidates
+                {"version": r["version"], "active": r["active"]}
+                for r in matched_records
             ],
         },
     )
+
+
+@app.post("/api/v1/messages/profile")
+def messages_profile(req: MessageProfileRequest):
+    """Parse 1-500 hex samples and return a statistical field profile grouped
+    by message version.
+
+    Each sample is processed independently, so one bad sample never aborts the
+    batch. An explicit ``version`` selects that definition (including inactive
+    ones); an omitted version is resolved per sample with the same rules as
+    ``/detect`` -- every registered version is tried in version order and a
+    sample counts only when exactly one version fully consumes it and passes
+    its checksum. Explicitly-versioned samples are accepted under the same
+    gate (full consumption + checksum verification): a checksum mismatch,
+    trailing bits or a checksum field skipped by a branch rejects the sample.
+
+    Rejected samples never enter the statistics. A rejection attributable to a
+    known version (explicit version given, parse/checksum failure) is listed in
+    that version group; failures without an attributable version -- bad hex, an
+    unknown explicit version, or a versionless sample with zero / several
+    detect candidates -- go to the top-level ``rejected`` list.
+
+    Each version group reports ``accepted_count`` and, per field in definition
+    order, ``present_count`` plus min/max/mean for numeric scalar values and
+    for every element of numeric repeat arrays (the element count is the
+    denominator, returned as ``element_count``). Fields skipped by a missed
+    condition are simply absent, so they count neither as present nor into any
+    denominator. Same-named fields of different versions are always isolated in
+    their own groups. Version groups come out in version order and their
+    rejected entries in request-index order.
+    """
+    records = database.list_definitions(req.device_type, include_inactive=True)
+    if not records:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no definitions found for device type '{req.device_type}'",
+        )
+    records.sort(key=lambda r: database.version_key(r["version"]))
+    records_by_version = {r["version"]: r for r in records}
+
+    profiles: dict[str, VersionProfile] = {}
+    top_rejected: list[dict] = []
+
+    def profile_for(version: str) -> VersionProfile:
+        profile = profiles.get(version)
+        if profile is None:
+            profile = VersionProfile(records_by_version[version])
+            profiles[version] = profile
+        return profile
+
+    for index, sample in enumerate(req.samples):
+        data, reason = _clean_hex(sample.hex)
+        if reason is not None:
+            top_rejected.append({"index": index, "reason": reason})
+            continue
+
+        if sample.version is not None:
+            record = records_by_version.get(sample.version)
+            if record is None:
+                top_rejected.append(
+                    {
+                        "index": index,
+                        "reason": (
+                            f"definition '{req.device_type}' version "
+                            f"'{sample.version}' not found"
+                        ),
+                    }
+                )
+                continue
+            result, rejection = _match_definition(record, data, unit="message")
+            if rejection is not None:
+                profile_for(record["version"]).rejected.append(
+                    {"index": index, "reason": rejection[1]}
+                )
+                continue
+            profile_for(record["version"]).add_accepted(result)
+            continue
+
+        matched_records, matched_result, failures = _detect_versions(
+            records, data, unit="message"
+        )
+        if len(matched_records) == 1:
+            record = matched_records[0]
+            profile_for(record["version"]).add_accepted(matched_result)
+        elif not matched_records:
+            top_rejected.append(
+                {"index": index, "reason": _no_detection_reason(failures)}
+            )
+        else:
+            versions = [r["version"] for r in matched_records]
+            top_rejected.append(
+                {"index": index, "reason": _ambiguous_detection_reason(versions)}
+            )
+
+    ordered_versions = sorted(profiles, key=database.version_key)
+    groups = [profiles[v].build() for v in ordered_versions]
+    accepted_total = sum(group["accepted_count"] for group in groups)
+    rejected_total = len(top_rejected) + sum(
+        len(group["rejected"]) for group in groups
+    )
+    return {
+        "device_type": req.device_type,
+        "sample_count": len(req.samples),
+        "accepted_count": accepted_total,
+        "rejected_count": rejected_total,
+        "rejected": top_rejected,
+        "versions": groups,
+    }
 
 
 @app.post("/api/v1/stream/parse")

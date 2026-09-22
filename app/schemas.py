@@ -164,6 +164,22 @@ class FixtureRunRequest(BaseModel):
     target_version: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
+class MessageProfileSample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # version omitted -> the version is auto-detected per sample with the same
+    # rules as /detect (all registered versions, unique match required).
+    hex: str
+    version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class MessageProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_type: str = Field(min_length=1, max_length=128)
+    samples: List[MessageProfileSample] = Field(min_length=1, max_length=500)
+
+
 def validate_definition(defn: DefinitionCreate) -> None:
     """Cross-field semantic validation. Raises ValueError on problems."""
     if not defn.fields:

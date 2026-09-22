@@ -2774,3 +2774,343 @@ def test_framer_callback_reject_reason_is_preserved():
     # one-byte resync: only the sync byte was attributed to the rejection
     assert (framer.discarded[0].start, framer.discarded[0].end) == (0, 1)
 
+
+# --------------------------------------------- batch message profiling --
+
+
+PROFILE_V1 = {
+    "device_type": "prof_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 4},
+        {"name": "flags", "type": "uint", "bit_length": 4},
+        {"name": "temperature", "type": "int", "bit_length": 16,
+         "endianness": "little", "scale": 0.1,
+         "condition": {"field": "msg_type", "op": "eq", "value": 1}},
+        {"name": "humidity", "type": "uint", "bit_length": 8,
+         "condition": {"field": "msg_type", "op": "eq", "value": 2}},
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+PROFILE_V2 = {
+    "device_type": "prof_dev",
+    "version": "2.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 8},
+        {"name": "temperature", "type": "int", "bit_length": 24,
+         "condition": {"field": "msg_type", "op": "eq", "value": 1}},
+        {"name": "humidity", "type": "uint", "bit_length": 8,
+         "condition": {"field": "msg_type", "op": "eq", "value": 2}},
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+
+def _crc16_msg(body: bytes) -> str:
+    return (body + crc16_ccitt(body).to_bytes(2, "big")).hex()
+
+
+def _setup_profile_device():
+    for payload in (PROFILE_V1, PROFILE_V2):
+        resp = client.post("/api/v1/definitions", json=payload)
+        assert resp.status_code in (201, 409), resp.text
+
+
+def test_messages_profile_groups_by_version_with_stats_and_rejections():
+    _setup_profile_device()
+
+    v1_temp = lambda raw: _crc16_msg(  # noqa: E731
+        bytes([0xAA, 0x10]) + raw.to_bytes(2, "little", signed=True)
+    )
+    v1_hum = _crc16_msg(bytes([0xAA, 0x20, 0x55]))
+    v2_temp = lambda raw: _crc16_msg(bytes([0xAA, 0x01]) + raw.to_bytes(3, "big", signed=True))  # noqa: E731
+    v2_hum = _crc16_msg(bytes([0xAA, 0x02, 0x55]))
+
+    good_v1 = v1_temp(235)
+    bad_v1 = good_v1[:-2] + ("00" if good_v1[-2:] != "00" else "ff")
+
+    samples = [
+        {"version": "1.0.0", "hex": v1_temp(235)},   # 0 temp 23.5
+        {"version": "1.0.0", "hex": v1_temp(210)},   # 1 temp 21.0
+        {"version": "1.0.0", "hex": v1_hum},         # 2 humidity 85
+        {"hex": v1_temp(100)},                        # 3 auto-detect v1 temp 10.0
+        {"version": "2.0.0", "hex": v2_temp(235)},   # 4 temp 235
+        {"version": "2.0.0", "hex": v2_temp(1000)},  # 5 temp 1000
+        {"hex": v2_hum},                              # 6 auto-detect v2 humidity
+        {"version": "1.0.0", "hex": bad_v1},          # 7 checksum mismatch
+        {"version": "1.0.0", "hex": "aa10"},          # 8 truncated
+        {"version": "2.0.0", "hex": v1_temp(235)},    # 9 too short for v2
+        {"hex": "aa"},                                # 10 no candidate
+        {"hex": "zzzz"},                              # 11 bad hex
+        {"version": "9.9.9", "hex": v1_temp(235)},    # 12 unknown version
+    ]
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": samples},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["device_type"] == "prof_dev"
+    assert data["sample_count"] == 13
+    assert data["accepted_count"] == 7
+    assert data["rejected_count"] == 6
+
+    # groups in version order, fields in definition order
+    assert [g["version"] for g in data["versions"]] == ["1.0.0", "2.0.0"]
+    g1, g2 = data["versions"]
+    assert [f["name"] for f in g1["fields"]] == [
+        "header", "msg_type", "flags", "temperature", "humidity", "crc",
+    ]
+    assert [f["name"] for f in g2["fields"]] == [
+        "header", "msg_type", "temperature", "humidity", "crc",
+    ]
+
+    assert g1["accepted_count"] == 4
+    assert [r["index"] for r in g1["rejected"]] == [7, 8]
+    assert all(set(r) == {"index", "reason"} for r in g1["rejected"])
+    assert "checksum mismatch" in g1["rejected"][0]["reason"]
+    assert "too short" in g1["rejected"][1]["reason"]
+
+    assert g2["accepted_count"] == 3
+    assert [r["index"] for r in g2["rejected"]] == [9]
+
+    # versionless failures have no attributable version -> top level
+    assert [r["index"] for r in data["rejected"]] == [10, 11, 12]
+    assert "no registered version matches" in data["rejected"][0]["reason"]
+    assert "invalid hex payload" in data["rejected"][1]["reason"]
+    assert "9.9.9" in data["rejected"][2]["reason"]
+
+    f1 = {f["name"]: f for f in g1["fields"]}
+    assert f1["header"]["present_count"] == 4
+    assert f1["header"]["min"] == f1["header"]["max"] == 0xAA
+    assert f1["msg_type"]["present_count"] == 4
+    assert f1["msg_type"]["min"] == 1 and f1["msg_type"]["max"] == 2
+    assert f1["msg_type"]["mean"] == 1.25
+    assert f1["flags"]["mean"] == 0.0
+    # condition-skipped fields only count the branch messages
+    assert f1["temperature"]["present_count"] == 3
+    assert f1["temperature"]["min"] == 10.0
+    assert f1["temperature"]["max"] == 23.5
+    assert f1["temperature"]["mean"] == round((10.0 + 21.0 + 23.5) / 3, 6)
+    assert f1["humidity"]["present_count"] == 1
+    assert f1["humidity"]["min"] == 85 and f1["humidity"]["mean"] == 85.0
+
+    # same-named fields are isolated per version: v2 msg_type is 8 bits,
+    # temperature is int24 with a different sample set
+    f2 = {f["name"]: f for f in g2["fields"]}
+    assert f2["msg_type"]["bit_length"] == 8
+    assert f2["msg_type"]["present_count"] == 3
+    assert f2["msg_type"]["mean"] == round((1 + 1 + 2) / 3, 6)
+    assert f2["temperature"]["bit_length"] == 24
+    assert f2["temperature"]["present_count"] == 2
+    assert f2["temperature"]["min"] == 235 and f2["temperature"]["max"] == 1000
+    assert f2["temperature"]["mean"] == 617.5
+    assert f2["humidity"]["present_count"] == 1
+
+
+def test_messages_profile_repeat_elements_aggregate_per_element():
+    payload = {
+        "device_type": "prof_rep",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "header", "type": "uint", "bit_length": 8},
+            {"name": "count", "type": "uint", "bit_length": 8},
+            {"name": "samples", "type": "uint", "bit_length": 16,
+             "endianness": "little", "scale": 0.1,
+             "repeat": {"field": "count", "max": 8}},
+            {"name": "crc", "type": "uint", "bit_length": 16},
+        ],
+        "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+    }
+    assert client.post("/api/v1/definitions", json=payload).status_code == 201
+
+    def rep_hex(values):
+        body = bytes([0xAA, len(values)]) + b"".join(
+            int(round(v * 10)).to_bytes(2, "little") for v in values
+        )
+        return _crc16_msg(body)
+
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={
+            "device_type": "prof_rep",
+            "samples": [
+                {"hex": rep_hex([10.0, 20.0])},
+                {"hex": rep_hex([30.0])},
+                {"hex": rep_hex([])},          # field present, zero elements
+                {"version": "1.0.0", "hex": "aa09"},  # count over max -> rejected
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["accepted_count"] == 3
+    group = data["versions"][0]
+    assert group["accepted_count"] == 3
+    assert [r["index"] for r in group["rejected"]] == [3]
+    fields = {f["name"]: f for f in group["fields"]}
+    samples_stat = fields["samples"]
+    # present in all three accepted messages (the empty array still counts)
+    assert samples_stat["present_count"] == 3
+    assert samples_stat["element_count"] == 3  # 2 + 1 + 0 elements
+    assert samples_stat["min"] == 10.0
+    assert samples_stat["max"] == 30.0
+    assert samples_stat["mean"] == 20.0
+
+
+def test_messages_profile_auto_detect_ambiguous_sample_is_top_level_rejected():
+    for version in ("1.0.0", "2.0.0"):
+        assert client.post(
+            "/api/v1/definitions",
+            json={
+                "device_type": "prof_dup",
+                "version": version,
+                "fields": [
+                    {"name": "a", "type": "uint", "bit_length": 8},
+                    {"name": "cs", "type": "uint", "bit_length": 8},
+                ],
+                "checksum": {"field": "cs", "algorithm": "sum8"},
+            },
+        ).status_code == 201
+
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dup", "samples": [{"hex": "3c3c"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["accepted_count"] == 0
+    assert data["rejected_count"] == 1
+    assert data["versions"] == []  # ambiguity attributes no version
+    assert data["rejected"][0]["index"] == 0
+    assert "matches 2 registered versions" in data["rejected"][0]["reason"]
+
+
+def test_messages_profile_inactive_version_explicit_and_detected():
+    assert client.post(
+        "/api/v1/definitions",
+        json={
+            "device_type": "prof_inact",
+            "version": "1.0.0",
+            "fields": [
+                {"name": "a", "type": "uint", "bit_length": 8},
+                {"name": "cs", "type": "uint", "bit_length": 8},
+            ],
+            "checksum": {"field": "cs", "algorithm": "sum8"},
+        },
+    ).status_code == 201
+    assert client.post(
+        "/api/v1/definitions/prof_inact/1.0.0/deactivate"
+    ).status_code == 200
+
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={
+            "device_type": "prof_inact",
+            "samples": [{"version": "1.0.0", "hex": "3c3c"}, {"hex": "3c3c"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    group = resp.json()["versions"][0]
+    assert group["version"] == "1.0.0"
+    assert group["definition_active"] is False
+    assert group["accepted_count"] == 2  # explicit and auto-detect both include it
+
+
+def test_messages_profile_groups_follow_numeric_version_order():
+    # 1-byte vs 2-byte payload keep detection unambiguous
+    order_defs = {
+        "1.9.0": [
+            {"name": "v", "type": "uint", "bit_length": 8},
+        ],
+        "1.10.0": [
+            {"name": "v", "type": "uint", "bit_length": 8},
+            {"name": "w", "type": "uint", "bit_length": 8},
+        ],
+    }
+    for version, fields in order_defs.items():
+        resp = client.post(
+            "/api/v1/definitions",
+            json={"device_type": "prof_order", "version": version, "fields": fields},
+        )
+        assert resp.status_code in (201, 409), resp.text
+
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={
+            "device_type": "prof_order",
+            "samples": [
+                {"version": "1.10.0", "hex": "0102"},
+                {"version": "1.9.0", "hex": "01"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    # numeric version ordering: 1.9.0 before 1.10.0 (lexicographic would invert)
+    assert [g["version"] for g in resp.json()["versions"]] == ["1.9.0", "1.10.0"]
+    assert resp.json()["versions"][0]["accepted_count"] == 1
+
+
+def test_messages_profile_request_validation():
+    # unknown device type
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "ghost", "samples": [{"hex": "aa"}]},
+    )
+    assert resp.status_code == 404
+
+    # empty sample list
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": []},
+    )
+    assert resp.status_code == 422
+
+    # more than 500 samples
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": [{"hex": "aa"}] * 501},
+    )
+    assert resp.status_code == 422
+
+    # unknown body / sample fields are forbidden
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": [{"hex": "aa"}], "extra": 1},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": [{"hex": "aa", "extra": 1}]},
+    )
+    assert resp.status_code == 422
+
+    # missing hex on a sample is a request-level schema error
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": [{"version": "1.0.0"}]},
+    )
+    assert resp.status_code == 422
+
+
+def test_messages_profile_accepts_exactly_500_samples_without_aborting():
+    _setup_profile_device()
+    body = bytes([0xAA, 0x20, 0x55])
+    good = _crc16_msg(body)
+    samples = [{"hex": good}] * 250 + [{"hex": "zz"}] * 250
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "prof_dev", "samples": samples},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["sample_count"] == 500
+    assert data["accepted_count"] == 250
+    assert data["rejected_count"] == 250
+    assert [r["index"] for r in data["rejected"]] == list(range(250, 500))
+
