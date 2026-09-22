@@ -101,6 +101,23 @@ class StreamParseRequest(BaseModel):
         return self
 
 
+class ProfileSample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hex: str = Field(min_length=2)
+    # omitted -> the version is auto-detected with the same rules as /detect
+    version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class ProfileRequest(BaseModel):
+    # Batch statistics: parse every sample independently and aggregate a
+    # per-version field profile; one bad sample never aborts the batch.
+    model_config = ConfigDict(extra="forbid")
+
+    device_type: str = Field(min_length=1, max_length=128)
+    samples: List[ProfileSample] = Field(min_length=1, max_length=500)
+
+
 class EncodeRequest(BaseModel):
     device_type: str
     version: Optional[str] = None  # omitted -> latest active version

@@ -2774,3 +2774,331 @@ def test_framer_callback_reject_reason_is_preserved():
     # one-byte resync: only the sync byte was attributed to the rejection
     assert (framer.discarded[0].start, framer.discarded[0].end) == (0, 1)
 
+
+
+# ------------------------------------------------------ batch message profile --
+
+
+# v1 carries conditional branches and a scaled int; v2 reuses the field name
+# "value" with a different layout so the tests can prove that same-named
+# fields of different versions are accumulated independently.
+PROFILE_V1 = {
+    "device_type": "profile_dev",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 4},
+        {"name": "flags", "type": "uint", "bit_length": 4},
+        {
+            "name": "value",
+            "type": "int",
+            "bit_length": 16,
+            "endianness": "little",
+            "scale": 0.1,
+            "condition": {"field": "msg_type", "op": "eq", "value": 1},
+        },
+        {
+            "name": "level",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "msg_type", "op": "eq", "value": 2},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+PROFILE_V2 = {
+    "device_type": "profile_dev",
+    "version": "2.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "value", "type": "uint", "bit_length": 16},
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+PROFILE_ARRAY = {
+    "device_type": "profile_array",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "count", "type": "uint", "bit_length": 8},
+        {
+            "name": "samples",
+            "type": "uint",
+            "bit_length": 16,
+            "endianness": "little",
+            "scale": 0.1,
+            "repeat": {"field": "count", "max": 8},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+PROFILE_MIXED = {
+    "device_type": "profile_mixed",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "enabled", "type": "bool", "bit_length": 1},
+        {"name": "code", "type": "uint", "bit_length": 7},
+        {"name": "magic", "type": "hex", "bit_length": 16},
+        {"name": "label", "type": "ascii", "bit_length": 16},
+    ],
+}
+
+
+def _profile_msg(body: bytes) -> str:
+    return (body + crc16_ccitt(body).to_bytes(2, "big")).hex()
+
+
+# temp branch (msg_type=1): little-endian scaled value; level branch (msg_type=2)
+PROFILE_T1 = _profile_msg(bytes([0xAA, 0x10, 0xEB, 0x00]))  # value 23.5
+PROFILE_T2 = _profile_msg(bytes([0xAA, 0x10, 0xC8, 0x00]))  # value 20.0
+PROFILE_T3 = _profile_msg(bytes([0xAA, 0x10, 0xFA, 0x00]))  # value 25.0
+PROFILE_L1 = _profile_msg(bytes([0xAA, 0x20, 0x55]))        # level 85
+PROFILE_W1 = _profile_msg(bytes([0xBB, 0x01, 0x02]))        # v2 value 258
+PROFILE_W2 = _profile_msg(bytes([0xBB, 0x01, 0x2C]))        # v2 value 300
+
+
+def _register_profile_devices():
+    for payload in (PROFILE_V1, PROFILE_V2, PROFILE_ARRAY, PROFILE_MIXED):
+        client.post("/api/v1/definitions", json=payload)
+
+
+def _profile(samples, device_type="profile_dev"):
+    return client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": device_type, "samples": samples},
+    )
+
+
+def _group(data, version):
+    return next(v for v in data["versions"] if v["version"] == version)
+
+
+def _field(group, name):
+    return next(f for f in group["fields"] if f["name"] == name)
+
+
+def test_profile_mixed_batch_grouped_by_version():
+    _register_profile_devices()
+    resp = _profile(
+        [
+            {"hex": PROFILE_W1},  # auto-detect -> 2.0.0 (6-byte t1 fits only v1)
+            {"hex": PROFILE_T1},  # auto-detect -> 1.0.0
+            {"version": "1.0.0", "hex": PROFILE_T2},
+            {"version": "1.0.0", "hex": PROFILE_T3},
+            {"version": "1.0.0", "hex": PROFILE_L1},
+            {"version": "2.0.0", "hex": PROFILE_W2},
+        ]
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["device_type"] == "profile_dev"
+    assert data["sample_count"] == 6
+    assert data["accepted_count"] == 6
+    assert data["rejected_count"] == 0
+    assert data["rejected"] == []
+
+    # version groups come out in version order even though a 2.0.0 sample
+    # arrived first
+    assert [v["version"] for v in data["versions"]] == ["1.0.0", "2.0.0"]
+
+    v1 = _group(data, "1.0.0")
+    assert v1["definition_active"] is True
+    assert v1["accepted_count"] == 4
+    # fields follow the definition order
+    assert [f["name"] for f in v1["fields"]] == [
+        "header", "msg_type", "flags", "value", "level", "crc",
+    ]
+    assert _field(v1, "header") == {
+        "name": "header", "present_count": 4, "value_count": 4,
+        "min": 0xAA, "max": 0xAA, "mean": 170.0,
+    }
+    msg_type = _field(v1, "msg_type")
+    assert (msg_type["present_count"], msg_type["min"], msg_type["max"]) == (4, 1, 2)
+    assert msg_type["mean"] == 1.25
+    # the temperature branch was hit by 3 of the 4 samples; statistics run
+    # over the scaled values (raw * 0.1)
+    value = _field(v1, "value")
+    assert value["present_count"] == 3
+    assert value["value_count"] == 3
+    assert (value["min"], value["max"]) == (20.0, 25.0)
+    assert value["mean"] == round((23.5 + 20.0 + 25.0) / 3, 6)  # 22.833333
+    # the level branch was hit exactly once
+    level = _field(v1, "level")
+    assert (level["present_count"], level["min"], level["max"], level["mean"]) == (
+        1, 85, 85, 85.0,
+    )
+
+    v2 = _group(data, "2.0.0")
+    assert v2["accepted_count"] == 2
+    # same field name as in v1, fully isolated statistics
+    value2 = _field(v2, "value")
+    assert value2["present_count"] == 2
+    assert (value2["min"], value2["max"], value2["mean"]) == (258, 300, 279.0)
+    assert _field(v2, "header")["min"] == 0xBB
+
+
+def test_profile_rejected_samples_never_enter_statistics():
+    _register_profile_devices()
+    bad_crc = PROFILE_T1[:-2] + ("00" if PROFILE_T1[-2:] != "00" else "ff")
+    resp = _profile(
+        [
+            {"version": "1.0.0", "hex": PROFILE_T1},
+            {"version": "1.0.0", "hex": bad_crc},            # checksum mismatch
+            {"version": "1.0.0", "hex": PROFILE_T1 + "ff"},  # trailing bits
+            {"version": "9.9.9", "hex": PROFILE_T1},         # unknown version
+            {"hex": "zz"},                                   # invalid hex
+            {"hex": "aa"},                                   # detect: no candidate
+            {"hex": PROFILE_L1},                             # detect: ambiguous
+        ]
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["sample_count"] == 7
+    assert data["accepted_count"] == 1
+    assert data["rejected_count"] == 6
+    assert data["accepted_count"] + data["rejected_count"] == data["sample_count"]
+
+    rejected = {r["index"]: r for r in data["rejected"]}
+    assert set(rejected) == {1, 2, 3, 4, 5, 6}
+    assert "checksum mismatch" in rejected[1]["reason"]
+    assert rejected[1]["version"] == "1.0.0"
+    assert "trailing bit" in rejected[2]["reason"]
+    assert "not found" in rejected[3]["reason"]
+    assert rejected[3]["version"] == "9.9.9"
+    assert "invalid hex" in rejected[4]["reason"]
+    assert rejected[4]["version"] is None
+    assert "no registered version matches" in rejected[5]["reason"]
+    # the 5-byte level message fits both v1 (level branch) and v2
+    assert "matches 2 registered versions" in rejected[6]["reason"]
+
+    # only the single good sample feeds the statistics
+    v1 = _group(data, "1.0.0")
+    assert v1["accepted_count"] == 1
+    assert _field(v1, "value")["present_count"] == 1
+    assert _field(v1, "value")["mean"] == 23.5
+    # level never hit: still listed in definition order with zeroed stats
+    assert _field(v1, "level") == {
+        "name": "level", "present_count": 0, "value_count": 0,
+        "min": None, "max": None, "mean": None,
+    }
+
+
+def test_profile_repeat_array_elements_aggregated():
+    _register_profile_devices()
+
+    def array_msg(samples):
+        body = bytes([0xAA, len(samples)]) + b"".join(
+            int(round(s * 10)).to_bytes(2, "little") for s in samples
+        )
+        return _profile_msg(body)
+
+    resp = _profile(
+        [
+            {"hex": array_msg([10.0, 20.0])},
+            {"hex": array_msg([1.0, 2.0, 3.0])},
+            {"hex": array_msg([])},  # count=0: field present, no elements
+        ],
+        device_type="profile_array",
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["accepted_count"] == 3
+    group = _group(data, "1.0.0")
+
+    samples = _field(group, "samples")
+    assert samples["present_count"] == 3  # the count=0 message still presents it
+    assert samples["value_count"] == 5    # every array element is aggregated
+    assert (samples["min"], samples["max"]) == (1.0, 20.0)
+    assert samples["mean"] == round((10.0 + 20.0 + 1.0 + 2.0 + 3.0) / 5, 6)  # 7.2
+
+    count = _field(group, "count")
+    assert (count["min"], count["max"]) == (0, 3)
+    assert count["mean"] == round(5 / 3, 6)  # 1.666667
+
+
+def test_profile_non_numeric_fields_report_presence_only():
+    _register_profile_devices()
+    # enabled=1, code=0x55, magic=0xABCD, label="OK"; no checksum configured,
+    # so full consumption alone accepts the message
+    resp = _profile(
+        [{"hex": "d5abcd4f4b"}, {"hex": "d5abcd4f4b"}], device_type="profile_mixed"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["accepted_count"] == 2
+    group = _group(data, "1.0.0")
+    by_name = {f["name"]: f for f in group["fields"]}
+    # bool / hex / ascii fields only carry present_count
+    assert by_name["enabled"] == {"name": "enabled", "present_count": 2}
+    assert by_name["magic"] == {"name": "magic", "present_count": 2}
+    assert by_name["label"] == {"name": "label", "present_count": 2}
+    assert by_name["code"]["min"] == 0x55
+    assert by_name["code"]["mean"] == 85.0
+
+
+def test_profile_inactive_version_still_profiled():
+    for version, fields in (
+        ("1.0.0", [{"name": "a", "type": "uint", "bit_length": 8}]),
+        ("2.0.0", [
+            {"name": "a", "type": "uint", "bit_length": 8},
+            {"name": "b", "type": "uint", "bit_length": 8},
+        ]),
+    ):
+        client.post(
+            "/api/v1/definitions",
+            json={"device_type": "profile_inactive", "version": version, "fields": fields},
+        )
+    client.post("/api/v1/definitions/profile_inactive/2.0.0/deactivate")
+
+    resp = _profile(
+        [{"hex": "2a"}, {"hex": "2a2b"}, {"version": "2.0.0", "hex": "0102"}],
+        device_type="profile_inactive",
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["accepted_count"] == 3
+    # auto-detect tries inactive versions too: "2a2b" only fits 2.0.0
+    assert [v["version"] for v in data["versions"]] == ["1.0.0", "2.0.0"]
+    assert _group(data, "1.0.0")["definition_active"] is True
+    v2 = _group(data, "2.0.0")
+    assert v2["definition_active"] is False
+    assert v2["accepted_count"] == 2
+    assert _field(v2, "b")["present_count"] == 2
+
+
+def test_profile_boundary_500_samples():
+    _register_profile_devices()
+    resp = _profile([{"hex": PROFILE_T1}] * 500)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["sample_count"] == 500
+    assert data["accepted_count"] == 500
+    v1 = _group(data, "1.0.0")
+    assert _field(v1, "header")["present_count"] == 500
+    assert _field(v1, "value")["mean"] == 23.5
+
+
+def test_profile_request_validation():
+    _register_profile_devices()
+    # unknown device type
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "ghost", "samples": [{"hex": "aabb"}]},
+    )
+    assert resp.status_code == 404
+    # empty sample list and more than 500 samples
+    assert _profile([]).status_code == 422
+    assert _profile([{"hex": PROFILE_T1}] * 501).status_code == 422
+    # unknown body fields are rejected, also inside a sample
+    resp = client.post(
+        "/api/v1/messages/profile",
+        json={"device_type": "profile_dev", "samples": [{"hex": PROFILE_T1}], "extra": 1},
+    )
+    assert resp.status_code == 422
+    assert _profile([{"hex": PROFILE_T1, "note": "x"}]).status_code == 422
+    # sample schema: hex is required and needs at least 2 characters
+    assert _profile([{"version": "1.0.0"}]).status_code == 422
+    assert _profile([{"hex": "a"}]).status_code == 422

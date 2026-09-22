@@ -2,7 +2,7 @@
 
 import re
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Response
 
@@ -22,6 +22,7 @@ from .framing import (
     StreamFramer,
 )
 from .parser import ParseError, parse_message
+from .profiler import VersionProfile
 from .schemas import (
     CompatibilityRequest,
     DefinitionCreate,
@@ -30,6 +31,7 @@ from .schemas import (
     FixtureCreate,
     FixtureRunRequest,
     ParseRequest,
+    ProfileRequest,
     StreamParseRequest,
     validate_definition,
 )
@@ -340,6 +342,125 @@ def detect(req: DetectRequest):
             ],
         },
     )
+
+
+def _detect_sample(
+    records: List[dict], data: bytes
+) -> Tuple[Optional[dict], Optional[dict], Optional[str]]:
+    """Auto-detect one profile sample with the /detect rules: every registered
+    version (including inactive ones, already sorted) is tried; exactly one
+    accepting version selects it, zero or several candidates yield a rejection
+    reason instead of guessing. Returns ``(record, result, None)`` on success,
+    otherwise ``(None, None, reason)``.
+    """
+    candidates = []
+    failures = []
+    for record in records:
+        result, rejection = _match_definition(record, data)
+        if rejection is None:
+            candidates.append((record, result))
+        else:
+            failures.append(f"{record['version']}: {rejection[1]}")
+
+    if len(candidates) == 1:
+        record, result = candidates[0]
+        return record, result, None
+    if not candidates:
+        reason = (
+            f"no registered version matches the message "
+            f"({len(failures)} version(s) tried): " + "; ".join(failures)
+        )
+        return None, None, reason
+    return None, None, (
+        f"message matches {len(candidates)} registered versions "
+        f"({', '.join(record['version'] for record, _ in candidates)}); "
+        f"an explicit version is required"
+    )
+
+
+@app.post("/api/v1/messages/profile")
+def messages_profile(req: ProfileRequest):
+    """Build a per-version statistical profile over a batch of 1-500 samples.
+
+    Every sample is parsed independently -- one bad sample never aborts the
+    batch. A sample is *accepted* by a version under the same conditions as
+    /detect (the definition fully consumes the message and, when a checksum
+    is configured, it verifies); this applies to explicit ``version`` samples
+    as well, so checksum failures and trailing bits land in ``rejected`` and
+    never enter the statistics. Samples without ``version`` are auto-detected
+    with the /detect rules (exactly one candidate required).
+
+    The response groups accepted samples by version (sorted in version
+    order): each group reports ``accepted_count`` and, for every field of the
+    version's definition *in definition order*, a ``present_count`` (fields
+    skipped by an unmatched condition are absent from the parse result and
+    therefore never counted). ``uint``/``int`` fields additionally aggregate
+    ``min``/``max``/``mean`` over the parsed ``value`` (after scale/offset);
+    repeated numeric fields contribute every array element, so their
+    ``value_count`` may exceed ``present_count``. Same-named fields of
+    different versions are accumulated independently.
+    """
+    records = database.list_definitions(req.device_type, include_inactive=True)
+    if not records:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no definitions found for device type '{req.device_type}'",
+        )
+    records.sort(key=lambda r: database.version_key(r["version"]))
+    by_version = {r["version"]: r for r in records}
+
+    profiles: Dict[str, VersionProfile] = {}
+    rejected: List[Dict[str, Any]] = []
+
+    for index, sample in enumerate(req.samples):
+        try:
+            data = _decode_hex(sample.hex)
+        except HTTPException as exc:
+            rejected.append(
+                {"index": index, "version": sample.version, "reason": exc.detail}
+            )
+            continue
+
+        if sample.version is not None:
+            record = by_version.get(sample.version)
+            if record is None:
+                rejected.append(
+                    {
+                        "index": index,
+                        "version": sample.version,
+                        "reason": f"definition '{req.device_type}' version "
+                        f"'{sample.version}' not found",
+                    }
+                )
+                continue
+            result, rejection = _match_definition(record, data)
+            if rejection is not None:
+                rejected.append(
+                    {"index": index, "version": sample.version, "reason": rejection[1]}
+                )
+                continue
+        else:
+            record, result, reason = _detect_sample(records, data)
+            if record is None:
+                rejected.append({"index": index, "version": None, "reason": reason})
+                continue
+
+        profile = profiles.get(record["version"])
+        if profile is None:
+            profile = profiles[record["version"]] = VersionProfile(record)
+        profile.add(result)
+
+    return {
+        "device_type": req.device_type,
+        "sample_count": len(req.samples),
+        "accepted_count": sum(p.accepted for p in profiles.values()),
+        "rejected_count": len(rejected),
+        "rejected": rejected,
+        "versions": [
+            profiles[version].to_dict()
+            for version in sorted(profiles, key=database.version_key)
+        ],
+    }
 
 
 @app.post("/api/v1/stream/parse")

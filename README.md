@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异；也可以对一批（1～500 条）报文生成**统计画像**：按版本分组统计各字段出现次数与数值字段的 min/max/mean。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -82,6 +82,7 @@ docker compose up --build
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
 | POST | `/api/v1/stream/parse` | 字节流分帧：按同步头 + 无符号长度字段从十六进制分块中重组并逐帧解析；支持 `version_mode=detect` 在同一批分块中自动识别混合固件版本 |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
+| POST | `/api/v1/messages/profile` | 批量报文统计画像：逐条解析 1～500 条样本（`version` 可省略，走自动识别），按版本分组给出各字段 `present_count` 与数值字段的 min/max/mean，失败样本列入 `rejected` 不中断整批 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
 | POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
 | GET  | `/api/v1/fixtures` | 列出回归样例，参数：`device_type` |
@@ -694,6 +695,78 @@ curl -X POST http://localhost:8000/api/v1/fixtures/temp-branch/run \
 - `total_checks = 字段项数 + 分支项数 + 1（校验）`，`pass_rate = passed_checks / total_checks`；全部一致且无解析错误时顶层 `passed` 为 `true`、`pass_rate` 为 `1.0`。
 - 列表 `GET /api/v1/fixtures?device_type=temp_sensor`；按名查询/删除支持 `?device_type=` 消歧，名称跨设备类型重复且未消歧时返回 409（`detail.candidates` 列出候选）。
 
+### 10. 批量报文统计画像（/messages/profile）
+
+收到一批报文、想快速了解「这批报文都是哪些版本、各字段取值分布如何」时，调用 `POST /api/v1/messages/profile`（服务地址 `http://localhost:8000`）。提交 **1～500 条**样本，服务**逐条独立解析**——单条失败不会中断整批——并按**版本分组**输出统计画像。
+
+**请求参数**
+
+| 参数 | 说明 |
+| ---- | ---- |
+| `device_type` | 设备类型；其下没有任何已注册版本（含停用）时返回 404 |
+| `samples` | 1～500 条样本的数组（空数组或超过 500 条返回 422） |
+| `samples[].hex` | 十六进制报文（清洗规则同 `/parse`：忽略空白、`_`、`-` 与 `0x` 前缀） |
+| `samples[].version` | 可选。省略时复用 `/detect` 的自动识别规则：尝试全部已注册版本（含停用），**恰好一个版本**接收才计入该版本；零候选或多候选都列入 `rejected` |
+
+**接收与拒绝规则**
+
+- 样本被某版本**接收**的条件与 `/detect` 一致：定义**完整消费**报文（无尾部位），且该版本配置了校验和时**校验通过**——显式指定 `version` 时同样适用。
+- 校验和不符、报文过短、存在尾部位、指定版本不存在、hex 非法、自动识别零候选/多候选的样本都列入 `rejected`，**不进入任何统计**；每条含 `index`（样本在请求中的下标）、`version`（显式指定的版本，自动识别失败时为 `null`）与 `reason`。
+- 顶层 `accepted_count + rejected_count == sample_count` 恒成立。
+
+**统计口径**
+
+- **按版本分组**：不同版本的同名字段各自独立统计、互不干扰；版本组按版本号排序输出（`1.10.0` 排在 `1.9.0` 之后）。
+- 每个版本组内字段按**定义顺序**输出（含从未出现的字段，其计数为 0）；`present_count` 为该字段在已接收样本中**实际出现**的次数——**条件未命中被跳过的字段不计入**，也不进入任何分母。
+- `uint`/`int` 字段额外给出 `value_count`（参与统计的值个数，即 min/max/mean 的分母）、`min`、`max`、`mean`；统计基于解析值 `value`（即应用 `scale`/`offset` 后的值），`mean` 保留 6 位小数。**repeat 数组字段的每个元素都单独计入**，因此其 `value_count` 可能大于 `present_count`。
+- `bool`/`hex`/`ascii` 字段只统计 `present_count`，不输出数值汇总。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/messages/profile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_type": "temp_sensor",
+    "samples": [
+      {"hex": "aa10eb008936"},
+      {"hex": "aa10c800da83"},
+      {"version": "1.0.0", "hex": "aa2055ba77"},
+      {"hex": "zz"}
+    ]
+  }'
+```
+
+上例中前两条省略 `version` 自动识别为 `1.0.0`（温度 23.5 与 20.0），第三条显式指定版本（湿度 85），第四条 hex 非法被拒绝。响应：
+
+```json
+{
+  "device_type": "temp_sensor",
+  "sample_count": 4,
+  "accepted_count": 3,
+  "rejected_count": 1,
+  "rejected": [
+    {"index": 3, "version": null,
+     "reason": "invalid hex payload: non-hex characters or odd number of digits"}
+  ],
+  "versions": [
+    {
+      "version": "1.0.0",
+      "definition_active": true,
+      "accepted_count": 3,
+      "fields": [
+        {"name": "header",      "present_count": 3, "value_count": 3, "min": 170, "max": 170, "mean": 170.0},
+        {"name": "msg_type",    "present_count": 3, "value_count": 3, "min": 1,   "max": 2,   "mean": 1.333333},
+        {"name": "flags",       "present_count": 3, "value_count": 3, "min": 0,   "max": 0,   "mean": 0.0},
+        {"name": "temperature", "present_count": 2, "value_count": 2, "min": 20.0, "max": 23.5, "mean": 21.75},
+        {"name": "humidity",    "present_count": 1, "value_count": 1, "min": 85,  "max": 85,  "mean": 85.0},
+        {"name": "crc",         "present_count": 3, "value_count": 3, "min": 35126, "max": 55939, "mean": 46266.666667}
+      ]
+    }
+  ]
+}
+```
+
+> `temperature` 只在 `msg_type == 1` 的两条样本中出现（`present_count: 2`），`humidity` 只在湿度分支的一条中出现——条件未命中的样本不计入分母；若该设备类型还注册了其他版本且样本命中，响应会按版本号顺序追加各自的版本组，同名字段互不影响。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -713,6 +786,7 @@ app/
   framing.py    # 字节流分帧（同步头 + 长度字段、跨块缓冲、逐字节重同步、1 MiB/64 KiB 上限）
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
+  profiler.py   # 批量统计画像：按版本分组累加字段 present_count 与数值 min/max/mean
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
   database.py   # SQLite 持久化（definitions / fixtures 两表，启动自动建表）
 tests/test_api.py
